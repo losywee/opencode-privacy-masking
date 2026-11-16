@@ -1,0 +1,15 @@
+{
+  "secrets": true,
+  "personal": true,
+  "preserveShape": true,
+  "words": ["internal-codename", "my-company-secret"],
+  "allow": ["localhost", "127.0.0.1", "demo@example.com"],
+  "localModel": {
+    "enabled": true,
+    "endpoint": "http://127.0.0.1:11434/v1/chat/completions",
+    "model": "qwen2.5:1.5b",
+    "timeoutMs": 2000,
+    "strict": false,
+    "sticky": true
+  }
+}

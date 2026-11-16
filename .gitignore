@@ -1,0 +1,14 @@
+node_modules/
+*.log
+.DS_Store
+
+# HMAC key for deterministic placeholders — never commit the real one
+*.key
+
+# Local PII detector disk cache
+privacy-masking-cache-*.json
+
+# Coverage / temp artifacts
+coverage/
+*.tmp
+/tmp/

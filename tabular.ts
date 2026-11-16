@@ -7,6 +7,8 @@
  * is a symlink to it, mirroring the other modules.
  */
 
+import { inflateRawSync } from "node:zlib";
+
 export type TableFormat = "csv" | "tsv" | "md" | "xlsx";
 
 export interface TableData {
@@ -116,15 +118,31 @@ export function resolveColumnPolicy(
 
 /**
  * Heuristic: does this text look like a table? Used to auto-route tool
- * outputs / message text that has no filename. Requires a header row plus
- * at least one data row with a consistent column count.
+ * outputs / message text that has no filename.
+ *
+ * Conservative by design: scalar masking is always safe, table routing
+ * rewrites structure (headers emitted verbatim, rows padded). So require
+ * >= 3 non-blank lines with STRICTLY consistent delimiter counts, and
+ * reject anything that looks like code/SQL/prose (terminators, braces,
+ * unbalanced quotes). Falls back to null (= scalar masking) on doubt.
  */
 export function detectTableFormat(text: string): TableFormat | null {
   if (!text || text.length < 8) return null;
   const sample = text.slice(0, 64 * 1024);
   const lines = sample.split(/\r?\n/).filter((l) => l.trim().length > 0);
-  if (lines.length < 2) return null;
   if (isMarkdownTable(lines)) return "md";
+  // CSV/TSV needs >= 3 non-blank lines, with an exception for 2-line input
+  // whose second line is LONGER than the header (more comma/tab-separated
+  // fields): a 2-line "table" like `a,b\n1,2,3` is indistinguishable from
+  // prose with commas (`API key is X, keep it safe\nSecond line, here`),
+  // so without extra evidence fall back to scalar masking.
+  if (lines.length < 3) {
+    if (lines.length !== 2) return null;
+    const [h, d] = lines;
+    const hc = (h.match(/,/g) || []).length + (h.match(/\t/g) || []).length;
+    const dc = (d.match(/,/g) || []).length + (d.match(/\t/g) || []).length;
+    if (!(hc >= 1 && dc > hc)) return null;
+    }
   const first = lines[0];
   const commaCount = (first.match(/,/g) || []).length;
   const tabCount = (first.match(/\t/g) || []).length;
@@ -133,12 +151,40 @@ export function detectTableFormat(text: string): TableFormat | null {
   const widths = lines.slice(0, Math.min(lines.length, 10)).map((l) => splitDelimited(l, delimiter).length);
   const headerWidth = widths[0];
   if (headerWidth < 2) return null;
-  let consistent = 0;
+  // STRICT consistency: every sampled line must have exactly the header width.
+  // The old `consistent >= 1` check routed SQL, code, and prose into the
+  // table pipeline and mangled it into {{COLUMN_...}} placeholders.
   for (let i = 1; i < widths.length; i++) {
-    if (widths[i] === headerWidth) consistent++;
-    else if (Math.abs(widths[i] - headerWidth) > 1) return null;
-  }
-  return consistent >= 1 ? (delimiter === "\t" ? "tsv" : "csv") : null;
+    if (widths[i] !== headerWidth) return null;
+    }
+  // Reject code/SQL/prose: statement terminators or braces at end of
+  // line, unbalanced quotes, or comment markers mean this is not a table.
+  // NOTE: closing braces mid-line (}}) are FINE - they appear in real
+  // cell values and JSON-ish content; only a terminator/brace as the very
+  // last char signals code. The old /[;{}]$/ also rejected nothing here,
+  // so keep it tight: semicolons (SQL) and trailing braces.
+  for (const l of lines.slice(0, Math.min(lines.length, 10))) {
+    const t = l.trim();
+    if (/;$/.test(t)) return null;
+    if (/[{}]$/.test(t) && !/,/.test(t.slice(0, -1))) return null;
+    // Prose guard: a text line (no digits, starts with a capital letter
+    // or greeting word, ends with a plain word) is not a table row. Real
+    // tables have headers with >= 2 delimiter-separated fields or data
+    // rows; chatty sentences like 'Hi there, see the docs' must not route.
+    // Prose-vs-row discriminator: a line with exactly ONE comma whose
+    // BOTH sides contain spaces is a sentence ('Hi there, see the docs'),
+    // not a row. Table rows have 2+ commas or a spaceless field
+    // ('Alice Smith,a', 'second line,here', 'a,b').
+    const nCommas = (t.match(/,/g) || []).length + (t.match(/\t/g) || []).length;
+    if (nCommas === 1 && delimiter === ",") {
+      const parts = splitDelimited(t, delimiter);
+      if (parts.length === 2 && /\s/.test(parts[0]) && /\s/.test(parts[1])) return null;
+    }
+
+    const quotes = (t.match(/"/g) || []).length;
+    if (quotes % 2 !== 0) return null;
+    }
+  return delimiter === "\t" ? "tsv" : "csv";
 }
 
 function isMarkdownTable(lines: string[]): boolean {
@@ -330,6 +376,9 @@ export function parseTableText(text: string, format: TableFormat): TableData {
 
 const DATA_CELL_RE = /^[\d\s$€£¥₹.,()%+/-]*$|^\d{4}-\d{2}-\d{2}/;
 
+// A SECRET-looking value (long alphanumeric token) is never a header label.
+const SECRET_VALUE_RE = /[A-Za-z0-9_./+=!@#$%^*~?-]{12,}/;
+
 /** A row of numbers/dates/empties is data, not a header. */
 function looksDataRow(row: string[]): boolean {
   let data = 0;
@@ -337,6 +386,15 @@ function looksDataRow(row: string[]): boolean {
   for (const cell of row) {
     const c = cell.trim();
     if (!c) continue;
+    // A row containing an email, IP, or secret-looking value is data with
+    // PII in it — never a header (headers are emitted verbatim downstream).
+    if (
+      /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(c) ||
+      /^(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)$/.test(c) ||
+      (SECRET_VALUE_RE.test(c) && /\d/.test(c) && /[A-Za-z]/.test(c))
+    ) {
+      return true;
+    }
     if (DATA_CELL_RE.test(c)) data++;
     else if (/[A-Za-z]{2,}/.test(c)) words++;
   }
@@ -449,7 +507,9 @@ function extractFileData(
     const raw = buf.subarray(start, start + compSize);
     if (method === 0) return Buffer.from(raw);
     if (method === 8) {
-      const { inflateRawSync } = require("node:zlib") as typeof import("node:zlib");
+      // NOTE: no `require()` here — this module is ESM, where require is
+      // undefined (ReferenceError). A top-level import keeps DEFLATE
+      // extraction working for real-world compressed XLSX workbooks.
       return Buffer.from(inflateRawSync(raw));
     }
     return null;

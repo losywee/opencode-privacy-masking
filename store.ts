@@ -37,6 +37,19 @@ interface Interval {
   end: number;
 }
 
+/**
+ * Coarse character class for exact-term boundary checks. Neighbors in the
+ * same class as the term's edge character indicate a longer token (e.g. an
+ * alphanumeric neighbor next to an alphanumeric edge, or a `.`/`@` neighbor
+ * next to a `.`/`@` edge in IPs and emails).
+ */
+function charClass(c: string): string {
+  if (/[A-Za-z0-9_]/.test(c)) return "word";
+  if (c === "-" || c === ".") return "sep";
+  if (c === "@") return "at";
+  return "other";
+}
+
 export class RedactStore {
   private readonly key: Buffer;
   public readonly config: MaskingConfig;
@@ -223,14 +236,23 @@ export class RedactStore {
    * Deterministic stand-in for IPv6: maps the full address into the
    * documentation range `2001:db8::/32` so masked logs keep their shape
    * (colon groups, scope suffix) while remaining non-routable.
+   * Emits a full 8-hextet address (2001:db8 + 6 derived groups = 128 bits)
+   * so standard validators (net.isIPv6, inet_pton) accept it.
    */
   private makeIpv6StandIn(value: string): string {
     const scopeIdx = value.indexOf("%");
     const scope = scopeIdx !== -1 ? value.slice(scopeIdx) : "";
     const addr = scopeIdx !== -1 ? value.slice(0, scopeIdx) : value;
     const hex = sha256(`IPV6\0${addr.toLowerCase()}`);
-    const groups = [hex.slice(0, 4), hex.slice(4, 8), hex.slice(8, 12), hex.slice(12, 16)];
-    return `2001:db8:${groups[0]}:${groups[1]}:${groups[2]}:${groups[3]}${scope}`;
+    const groups = [
+      hex.slice(0, 4),
+      hex.slice(4, 8),
+      hex.slice(8, 12),
+      hex.slice(12, 16),
+      hex.slice(16, 20),
+      hex.slice(20, 24),
+    ];
+    return `2001:db8:${groups.join(":")}${scope}`;
   }
 
   private collectRuleSpans(text: string, asJsonText: boolean, existing: Interval[]): Span[] {
@@ -290,14 +312,18 @@ export class RedactStore {
       let idx = 0;
       while ((idx = text.indexOf(val, idx)) !== -1) {
         const end = idx + val.length;
+        // Boundary check on BOTH sides for every term, not just
+        // alphanumeric ones: "198.51.100.4" must not match inside
+        // "198.51.100.42", and "user@example.com" must not match inside
+        // "superuser@example.com". A neighbor char of the same class as the
+        // term's edge char means we are inside a longer token.
         let wordBoundary = true;
-        if (/^[A-Za-z0-9_-]+$/.test(val)) {
-          const before = idx > 0 ? text[idx - 1] : "";
-          const after = end < text.length ? text[end] : "";
-          if (/[A-Za-z0-9_-]/.test(before) || /[A-Za-z0-9_-]/.test(after)) {
-            wordBoundary = false;
-          }
-        }
+        const first = val[0];
+        const last = val[val.length - 1];
+        const before = idx > 0 ? text[idx - 1] : "";
+        const after = end < text.length ? text[end] : "";
+        if (before && charClass(before) === charClass(first)) wordBoundary = false;
+        else if (after && charClass(after) === charClass(last)) wordBoundary = false;
         if (
           wordBoundary &&
           !this.overlapsIntervals(existing, idx, end) &&
@@ -460,21 +486,47 @@ export class RedactStore {
     turnDeadline: number
   ): Promise<string> {
     if (!value) return value;
+    // Exact learned secrets (sticky .env / seen values) always win, even in
+    // "keep" columns: a real secret must never pass through because its
+    // column header looked innocent.
+    const exactHit = this.findExactTerm(value);
+    if (exactHit) {
+      const placeholder = this.makePlaceholder(exactHit.kind, value);
+      this.learnValue(value, exactHit.kind);
+      this.hasMaskedAny = true;
+      return placeholder;
+    }
     const policy = resolveColumnPolicy(header, this.config.tabular);
     if (policy === "keep") return value;
-    if (policy === "rules") {
-      return this.maskCellRulesAsync(value, turnDeadline);
-    }
-    // "mask": try rule/SLM masking first so structured values keep shape
-    // (203.0.113.x, *.example), then force a whole-cell placeholder.
+    // "mask" AND "rules" both run the scalar rule/SLM pipeline first, so
+    // emails, secrets, and IPs in body cells are masked even when the column
+    // header is generic ("Column 1") or the table was auto-detected. "mask"
+    // additionally forces a whole-cell placeholder when no rule fires.
     const viaRules = await this.maskCellRulesAsync(value, turnDeadline);
     if (viaRules !== value) return viaRules;
+    if (policy === "rules") return value;
     if (this.isAllowed(value)) return value;
+    // "mask": force a whole-cell placeholder even when no rule fires
+    // (e.g. a name no regex or SLM run would catch). Structured values keep
+    // shape (203.0.113.x, *.example) via maskCellRulesAsync above.
     const kind = this.kindForWholeCell(header, value);
     const placeholder = this.makePlaceholder(kind, value);
     this.learnValue(value, kind);
     this.hasMaskedAny = true;
     return placeholder;
+  }
+
+  /**
+   * Whole-value exact-term lookup (mirrors the boundary logic in
+   * collectRuleSpans): returns the kind when the ENTIRE cell value is a
+   * known secret, so masks apply even in "keep" columns or "rules" cells
+   * no regex would fire on.
+   */
+  private findExactTerm(value: string): { kind: string } | null {
+    if (value.length < 4 || this.isAllowed(value)) return null;
+    if (this.envSecrets.has(value)) return { kind: "SECRET" };
+    const kind = this.knownValues.get(value);
+    return kind ? { kind } : null;
   }
 
   /** Scalar-equivalent masking for a single cell without table re-routing. */
@@ -485,7 +537,18 @@ export class RedactStore {
       const frozen = this.stickyByRawHash.get(rawHash);
       if (frozen !== undefined) return frozen;
     }
+    // A cell that IS an already-masked placeholder/stand-in must pass through
+    // untouched: extractExistingIntervals SKIPS rule spans overlapping it,
+    // but collectRuleSpans would still learn the raw secret into knownValues
+    // via exactTerms on the NEXT call. Short-circuit before any learning.
+    // (The scalar maskAsync path cannot hit this: its overlap check happens
+    // before learning too, but cells bypass it since each cell is masked in
+    // isolation with no knowledge of sibling cells' placeholders.)
+    if (this.placeholderToReal.has(value)) return value;
     const existing = this.extractExistingIntervals(value);
+    if (existing.length > 0 && existing.some((iv) => iv.start === 0 && iv.end === value.length)) {
+      return value;
+    }
     const spans = this.collectRuleSpans(value, false, existing);
     const ruleMasked = this.applySpans(value, spans);
     if (
@@ -579,8 +642,15 @@ export class RedactStore {
     // span the whole input, fall back to scalar masking so surrounding prose
     // is preserved instead of silently dropped.
     if (fmt === "md" && !markdownTableCoversText(text, table)) return null;
+    // Defense in depth: headers are emitted verbatim by serializeTable, so
+    // scrub them with scalar rules. A misclassified header row carrying a
+    // secret/email would otherwise leak in cleartext to the upstream LLM.
+    const maskedHeaders: string[] = [];
+    for (const h of table.headers) {
+      maskedHeaders.push(await this.maskCellRulesAsync(h, turnDeadline));
+    }
     const maskedRows = await this.maskTableAsync(table, turnDeadline);
-    return serializeTable(table, maskedRows);
+    return serializeTable({ ...table, headers: maskedHeaders }, maskedRows);
   }
 
   /**

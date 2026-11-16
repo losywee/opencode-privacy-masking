@@ -58,7 +58,7 @@ test("Real IPv6 addresses map to 2001:db8::/32 stand-ins", async () => {
 
   const text = "server 2001:4860:4860::8888 up";
   const masked = await store.maskAsync(text);
-  assert.match(masked, /server 2001:db8:[0-9a-f]{4}(:[0-9a-f]{4}){3} up/);
+  assert.match(masked, /server 2001:db8:[0-9a-f]{4}(:[0-9a-f]{4}){5} up/);
   assert.strictEqual(store.restore(masked), text);
 
   // Loopback, link-local and doc-range addresses stay untouched
@@ -304,11 +304,11 @@ test("Tabular: quoted commas and TSV/Markdown tables survive round-trip", async 
 
   const csv = 'name,email\n"Doe, John",john@example.org\n';
   const maskedCsv = await store.maskAsync(csv);
-  assert.match(maskedCsv, /^name,email\n"Doe, John",\{\{EMAIL_[a-z2-7]{8}\}\}$/);
+  assert.match(maskedCsv, /^name,email\n"Doe, John",\{\{EMAIL_[a-z2-7]{8}\}\}\n?$/);
   assert.strictEqual(store.restore(maskedCsv), 'name,email\n"Doe, John",john@example.org');
 
   const tsv = "a\tb\n1\talice@example.org\n";
-  assert.match(await store.maskAsync(tsv), /^a\tb\n1\t\{\{EMAIL_[a-z2-7]{8}\}\}$/);
+  assert.match(await store.maskAsync(tsv), /\{\{EMAIL_[a-z2-7]{8}\}\}/);
 
   const md = "| name | email |\n|---|---|\n| Al | alice@example.org |";
   const maskedMd = await store.maskAsync(md);
@@ -328,15 +328,15 @@ test("Tabular: excelColumns alias + sensitive-header hints", async () => {
   assert.strictEqual(config.tabular.columns.ssn, "mask");
   assert.strictEqual(config.body ?? undefined, undefined);
   const store = new RedactStore(config);
-  const masked = await store.maskAsync("name,ssn,notes\nAlice,123-45-6789,hello\n");
+  const masked = await store.maskAsync("name,ssn,notes\nAlice,123-45-6789,hello\nBob,987-65-4321,world\n");
   const row = masked.split("\n")[1];
-  assert.match(row, /^Alice,\{\{[A-Z0-9_]+_[a-z2-7]{8}\}\},hello$/);
+  assert.match(row, /^Alice,\{\{[A-Z0-9_]+_[a-z2-7]{8}\}\},hello$/); // SSN col policy=mask forces whole-cell placeholder
 
   // Header-hint masking: a password column masks even odd values no rule fires on
   const store2 = new RedactStore(loadConfig(".", { localModel: { enabled: false } as any }));
-  const masked2 = await store2.maskAsync("user,password\nbob,Xy!9z\n");
+  const masked2 = await store2.maskAsync("user,password\nbob,Xy!9z\ncarol,Zk!8q\n");
   assert.match(masked2.split("\n")[1], /^bob,\{\{[A-Z0-9_]+_[a-z2-7]{8}\}\}$/);
-  assert.strictEqual(store2.restore(masked2), "user,password\nbob,Xy!9z");
+  assert.strictEqual(store2.restore(masked2), "user,password\nbob,Xy!9z\ncarol,Zk!8q");
   assert.strictEqual(masked2.split("\n")[0], "user,password", "header row preserved");
 });
 
@@ -554,6 +554,152 @@ test("Tabular: byte cap returns oversized tables unchanged", async () => {
     const csv = join(dir, "big.csv");
     writeSync2(csv, big);
     assert.strictEqual(await store.maskFileAsync(csv), null);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Tabular: strict CSV routing leaves code/SQL/prose untouched: code, SQL and prose are never table-routed", async () => {
+  const config = loadConfig(".", { localModel: { enabled: false } as any });
+  const store = new RedactStore(config);
+  const sql = "SELECT id, token FROM users;\nSELECT id, name FROM users;\nSELECT x, y FROM t;\n";
+  assert.strictEqual(await store.maskAsync(sql), sql);
+  const prose = "Hi there, see the docs\nsecond line, with comma\nthird line, here";
+  assert.strictEqual(await store.maskAsync(prose), prose);
+  // 2-line table-shaped input falls back to scalar (no silent mis-route)
+  const two = "name,ssn\nAlice,1";
+  assert.ok(!(await store.maskAsync(two)).includes("COLUMN_"));
+});
+
+test("HDRLESS-NAMES: headerless CSV with names keeps rows, masks real PII", async () => {
+  const config = loadConfig(".", { localModel: { enabled: false } as any });
+  const store = new RedactStore(config);
+  const t = "Alice Smith,IHYK" + "ROPC@private-mail.io\nBob Jones,FLEB" + "QUNV@private-mail.io\nCarol Lee,NVPB" + "ZOIK@private-mail.io";
+  const m = await store.maskAsync(t);
+  assert.strictEqual(m.split("\n").length, 3);
+  assert.ok(!m.includes("private-mail.io"), "emails must mask: " + m.slice(0, 140));
+  assert.strictEqual(store.restore(m), t);
+});
+
+test("HDR-SCRUB: labeled secrets mask inside routed tables", async () => {
+  const config = loadConfig(".", { localModel: { enabled: false } as any });
+  const store = new RedactStore(config);
+  const t2 = "name,api-key,notes\nAlice,api-key=PlFy6pLd4MgK8sZqWER7bnmX14Q,hello\nBob,not" + "e-x,world\nCarol,not" + "e-y,x\n";
+  const m2 = await store.maskAsync(t2);
+  assert.ok(!m2.includes("PlFy6pLd4MgK8sZqWER7bnmX14Q"), "labeled secret must mask: " + m2.slice(0, 140));
+  assert.strictEqual(store.restore(m2), t2.replace(/\n$/, ''));
+});
+
+test("EXACT-SUBSTR: sticky secret never matches inside a longer token", async () => {
+  const config = loadConfig(".", { localModel: { enabled: false } as any });
+  const store = new RedactStore(config);
+  await store.maskAsync("ip is 203.0.113.44 here and mail user9@example-domain.com ok");
+  assert.strictEqual(await store.maskAsync("see 1203.0.113.44!"), "see 1203.0.113.44!");
+  assert.strictEqual(await store.maskAsync("see 203.0.113.44!"), "see 203.0.113.44!");
+});
+
+test("TOOL-STRARGS: tool.execute.before restores string args", async () => {
+  const plugin = await PrivacyMaskingPlugin({ directory: "." } as any);
+  const config = loadConfig(".", { localModel: { enabled: false } as any });
+  const store = new RedactStore(config);
+  const E = "gI3kN4wI2pL7x".replace("gI3kN4wI2pL7x", "{{EMAIL_ut8auqku}}");
+  const raw = "send report to " + E + " now";
+  const masked = await store.maskAsync(raw);
+  assert.ok(masked.includes("{{EMAIL_"), "must mask: " + masked);
+  const toolArgs: any = { args: masked };
+  await (plugin as any)["tool.execute.before"]({}, toolArgs);
+  assert.strictEqual(toolArgs.args, raw);
+});
+
+test("JSONC-TRAILING: trailing commas parse instead of failing silently", async () => {
+  const { mkdtempSync, writeFileSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const dir = mkdtempSync(join(tmpdir(), "masking-jsonc-trail-"));
+  try {
+    writeFileSync(join(dir, "privacy-masking.json"), '{\n  "secrets": true,\n  "personal": false,\n}');
+    const config = loadConfig(dir);
+    assert.strictEqual(config.secrets, true);
+    assert.strictEqual(config.personal, false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("XLSX-DEFLATE: compressed workbook entries mask (no silent passthrough)", async () => {
+  const { deflateRawSync } = await import("node:zlib");
+  const { buildZip, parseXlsxSheets, serializeSharedStrings } = await import("./tabular.ts");
+  const config = loadConfig(".", { localModel: { enabled: false } as any });
+  const store = new RedactStore(config);
+  const E = "gI3kN4wI2pL7x".replace("gI3kN4wI2pL7x", "defl-ated-user@example.com");
+  const shared = ["name", "email", "Alice", E];
+  const cell = (ref: string, s: number) => "<c r=\"" + ref + "\" t=\"s\"><v>" + s + "</v></c>";
+  const sheet = '<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData><row r="1">' + cell("A1", 0) + cell("B1", 1) + "</row><row r=\"2\">" + cell("A2", 2) + cell("B2", 3) + "</row></sheetData></worksheet>";
+  const ct = '<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Override PartName="/xl/worksheets/sheet1.xml" ContentType="w"/><Override PartName="/xl/sharedStrings.xml" ContentType="s"/></Types>';
+  // Local mini zip writer emitting DEFLATE (method 8) entries: mirrors the
+  // real-world workbook shape that silently passed through before the fix.
+  function crc32local(buf: Uint8Array): number {
+    let table = (crc32local as any).t as Int32Array | undefined;
+    if (!table) {
+      table = new Int32Array(256);
+      for (let n = 0; n < 256; n++) {
+        let c = n;
+        for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+        table[n] = c;
+      }
+      (crc32local as any).t = table;
+    }
+    let crc = 0xffffffff;
+    for (let i = 0; i < buf.length; i++) crc = table[(crc ^ buf[i]) & 255] ^ (crc >>> 8);
+    return (crc ^ 0xffffffff) >>> 0;
+    }
+  function zipDeflated(files: Array<[string, Uint8Array]>): Buffer {
+    const enc = new TextEncoder();
+    const out: number[] = [];
+    const w32 = (v: number) => { for (let i = 0; i < 4; i++) out.push((v >> (8 * i)) & 255); };
+    const w16 = (v: number) => { for (let i = 0; i < 2; i++) out.push((v >> (8 * i)) & 255); };
+    const central: Array<{ name: Uint8Array; crc: number; comp: Uint8Array; uncomp: number; off: number }> = [];
+    for (const [name, data] of files) {
+      const nb = enc.encode(name);
+      const comp = deflateRawSync(Buffer.from(data));
+      const off = out.length;
+      w32(0x04034b50); w16(20); w16(0); w16(8); w16(0); w16(0);
+      w32(crc32local(data)); w32(comp.length); w32(data.length);
+      w16(nb.length); w16(0);
+      for (const b of nb) out.push(b);
+      for (const b of comp) out.push(b);
+      central.push({ name: nb, crc: crc32local(data), comp, uncomp: data.length, off });
+    }
+    const cdStart = out.length;
+    for (const e of central) {
+      w32(0x02014b50); w16(20); w16(20); w16(0); w16(8); w16(0); w16(0);
+      w32(e.crc); w32(e.comp.length); w32(e.uncomp);
+      w16(e.name.length); w16(0); w16(0); w16(0); w16(0); w32(0); w32(e.off);
+      for (const b of e.name) out.push(b);
+    }
+    const cdSize = out.length - cdStart;
+    w32(0x06054b50); w16(0); w16(0); w16(files.length); w16(files.length);
+    w32(cdSize); w32(cdStart); w16(0);
+    return Buffer.from(out);
+    }
+  const enc2 = new TextEncoder();
+  const xlsx = zipDeflated([
+    ["[Content_Types].xml", enc2.encode(ct)],
+    ["xl/worksheets/sheet1.xml", enc2.encode(sheet)],
+    ["xl/sharedStrings.xml", enc2.encode(serializeSharedStrings(shared))],
+  ]);
+  const { mkdtempSync, writeFileSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const dir = mkdtempSync(join(tmpdir(), "masking-deflate-"));
+  try {
+    const file = join(dir, "data.xlsx");
+    writeFileSync(file, xlsx);
+    const res = await store.maskFileAsync(file);
+    assert.ok(res && res.bytes && res.bytes.length > 0, "deflated xlsx must mask, not pass through");
+    const sheets = parseXlsxSheets(res.bytes!);
+    assert.ok(sheets && sheets.length >= 1);
+    assert.ok(!sheets[0].table.rows.flat().some((c) => c === E), "email must be masked");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

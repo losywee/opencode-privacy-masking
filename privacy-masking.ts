@@ -67,7 +67,9 @@ export const PrivacyMaskingPlugin: Plugin = async (ctx) => {
 
     // 3. Restore real values in-place inside tool arguments before local execution.
     "tool.execute.before": async (_input, output) => {
-      if (output.args && typeof output.args === "object") {
+      if (typeof output.args === "string") {
+        output.args = store.restore(output.args);
+      } else if (output.args && typeof output.args === "object") {
         store.restoreDeep(output.args);
       }
     },

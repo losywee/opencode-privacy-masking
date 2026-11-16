@@ -11,7 +11,7 @@ import { Buffer } from "node:buffer";
  * and hostname stand-ins `xxxxxxxx.example`.
  */
 export const EXISTING_TOKEN_RE =
-  /\{\{[A-Z0-9_]+_[a-z2-7]{8}\}\}|2001:db8(?::[A-Fa-f0-9]{1,4}){4}(?:%[A-Za-z0-9._-]+)?|(?<![A-Za-z0-9_.-])(?:203\.0\.113\.\d{1,3}|[a-z]{8}\.example)(?![A-Za-z0-9_.-])/g;
+  /\{\{[A-Z0-9_]+_[a-z2-7]{8}\}\}|(?<![A-Za-z0-9:_.])2001:db8(?::[A-Fa-f0-9]{1,4}){6}(?:%[A-Za-z0-9._-]+)?(?![A-Za-z0-9:_.])|(?<![A-Za-z0-9_.-])(?:203\.0\.113\.\d{1,3}|[a-z]{8}\.example)(?![A-Za-z0-9_.-])/g;
 
 /**
  * Returns true only when `text` is an actual base64-encoded media data URL
@@ -85,7 +85,12 @@ export const RULES: Rule[] = [
   {
     kind: "SECRET",
     category: "secret",
-    re: /(?:^|[\s,{'"`(\["])([\w.-]*?(?:api[_-]?key|secret[_-]?key|access[_-]?token|auth[_-]?token|password|passwd|private[_-]?key|client[_-]?secret|token[_-]?signing[_-]?key)[\w.-]*)['"`]?\s*[:=]\s*['"`]?([A-Za-z0-9_./+=\-!@#$%^*~?]{12,})['"`]?/gid,
+    re: /(?:^|[\s,{'"`(\["])([\w.-]*?(?:api[_-]?key|secret|access[_-]?token|auth[_-]?token|password|passwd|private[_-]?key|client[_-]?secret|token)[\w.-]*)['"`]?\s*[:=]\s*['"`]?([A-Za-z0-9_./+=\-!@#$%^*~?]{8,})['"`]?/gid,
+    // SSN-shaped (123-45-6789): PII, not a secret; the SLM/table layer handles it.
+    validate: (m) => {
+      if (/^\d{3}-\d{2}-\d{4}$/.test(m)) return false;
+      return true;
+    },
     group: 2,
     validate: (m) => {
       // Skip RFC 3339 timestamps (Issue #5002), semver strings, and owner/repo paths (Issue #3365)

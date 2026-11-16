@@ -165,6 +165,8 @@ function stripJsonComments(raw: string): string {
   // (e.g. "endpoint": "http://127.0.0.1:11434/...") is preserved,
   // while whole-line, trailing, and /* */ comments are removed.
   // Handles escaped quotes (\") so strings with escapes don't desync.
+  // Also strips JSONC trailing commas (`,}` / `,]`) so standard .jsonc
+  // configs parse instead of failing silently with a SyntaxError.
   let out = "";
   let inString = false;
   let inLineComment = false;
@@ -199,17 +201,40 @@ function stripJsonComments(raw: string): string {
     if (c === '"') {
       inString = true;
       out += c;
-    } else if (c === "/" && next === "/") {
+      } else if (c === "/" && next === "/") {
       inLineComment = true;
       i++; // skip second /
-    } else if (c === "/" && next === "*") {
+      } else if (c === "/" && next === "*") {
       inBlockComment = true;
       i++; // skip *
-    } else {
+      } else {
       out += c;
-    }
+      }
   }
-  return out;
+  // Strip trailing commas outside strings: `,}` -> `}`, `,]` -> `]`.
+  let stripped = "";
+  inString = false;
+  for (let i = 0; i < out.length; i++) {
+    const c = out[i];
+    if (inString) {
+      stripped += c;
+      if (c === "\\" && i + 1 < out.length) stripped += out[++i];
+      else if (c === '"') inString = false;
+      continue;
+    }
+    if (c === '"') {
+      inString = true;
+      stripped += c;
+      continue;
+    }
+    if (c === ",") {
+      let j = i + 1;
+      while (j < out.length && /\s/.test(out[j])) j++;
+      if (out[j] === "}" || out[j] === "]") continue; // drop trailing comma
+    }
+    stripped += c;
+    }
+  return stripped;
 }
 
 function readJsonFile(filePath: string): Record<string, unknown> | null {

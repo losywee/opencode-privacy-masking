@@ -1,6 +1,5 @@
 {
   "$schema": "https://opencode.ai/config.json",
-  "plugin": ["file://.opencode/plugins/privacy-masking.ts"],
   "env": {
     "OPENCODE_MASKING_MODEL": "1",
     "OPENCODE_MASKING_URL": "http://127.0.0.1:11434/v1/chat/completions",

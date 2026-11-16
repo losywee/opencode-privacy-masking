@@ -187,6 +187,19 @@ export function parseCsvLine(line: string, delimiter = ","): string[] {
   return out;
 }
 
+/**
+ * True when a Markdown table spans every non-blank line of the input.
+ * serializeTable() rebuilds only the table, so routing a table+prose mix
+ * through the table pipeline would silently DROP the surrounding prose.
+ * Callers must fall back to scalar masking when this returns false.
+ */
+export function markdownTableCoversText(text: string, table: TableData): boolean {
+  const nonBlank = text.split(/\r?\n/).filter((l) => l.trim() !== "").length;
+  // Source = body rows + delimiter row + (header row unless headerless).
+  const expected = table.rows.length + (table.headerless ? 1 : 2);
+  return table.rows.length > 0 && nonBlank === expected;
+}
+
 /** Parse a full CSV/TSV document (handles multi-line quoted fields). */
 export function parseDelimited(text: string, delimiter: "," | "\t"): string[][] {
   const rows: string[][] = [];
@@ -332,7 +345,9 @@ function looksDataRow(row: string[]): boolean {
 
 export function serializeTable(table: TableData, rows: string[][]): string {
   if (table.format === "tsv") return serializeDelimited([table.headers, ...rows].slice(table.headerless ? 1 : 0), "\t");
-  if (table.format === "md") return serializeMarkdownTable(table.headers, table.headerless ? rows.slice(1) : rows);
+  // NOTE: headerless tables keep ALL rows (rows[0] is data, not a header).
+  // rows.slice(1) here would silently drop the first data row (Issue: md data loss).
+  if (table.format === "md") return serializeMarkdownTable(table.headers, rows);
   return serializeDelimited(table.headerless ? rows : [table.headers, ...rows], ",");
 }
 
@@ -606,7 +621,17 @@ export function parseSheetCells(xml: string): SheetCell[] {
  * Read the first worksheet of an XLSX buffer into a TableData.
  * Only string cells (shared/inline) participate; numbers/dates pass through.
  */
-export function parseXlsx(buf: Buffer): TableData | null {
+export interface XlsxSheet {
+  name: string;
+  table: TableData;
+}
+
+/**
+ * Read ALL worksheets of an XLSX buffer (shared + inline strings).
+ * Sheets with no string cells yield an empty table each — callers that only
+ * need the first sheet can use sheets[0].table (same as the old parseXlsx).
+ */
+export function parseXlsxSheets(buf: Buffer): XlsxSheet[] | null {
   let files: Map<string, Buffer>;
   try {
     files = parseZip(buf);
@@ -615,7 +640,6 @@ export function parseXlsx(buf: Buffer): TableData | null {
   }
   const sheetNames = [...files.keys()].filter((n) => /^xl\/worksheets\/sheet\d+\.xml$/.test(n)).sort();
   if (sheetNames.length === 0) return null;
-  const sheetXml = files.get(sheetNames[0])!.toString("utf8");
   let shared: string[] = [];
   const sharedXml = files.get("xl/sharedStrings.xml");
   if (sharedXml) {
@@ -625,52 +649,81 @@ export function parseXlsx(buf: Buffer): TableData | null {
       shared = [];
     }
   }
-  const cells = parseSheetCells(sheetXml);
-  if (cells.length === 0) return { format: "xlsx", headers: [], rows: [], headerless: true };
-  const maxRow = Math.max(...cells.map((c) => c.row));
-  const maxCol = Math.max(...cells.map((c) => c.col));
-  if (maxRow < 1 || maxCol < 1) return { format: "xlsx", headers: [], rows: [], headerless: true };
-  const grid: string[][] = Array.from({ length: maxRow }, () => Array(maxCol).fill(""));
-  for (const c of cells) {
-    let text = "";
-    if (c.type === "s") {
-      const idx = parseInt(c.value, 10);
-      text = Number.isFinite(idx) && idx >= 0 && idx < shared.length ? shared[idx] : "";
-    } else if (c.type === "inlineStr" || c.type === "str") {
-      text = c.value;
-    } else {
-      continue; // numeric/bool/date/formula result — leave untouched
+  const out: XlsxSheet[] = [];
+  for (const sheetName of sheetNames) {
+    const sheetXml = files.get(sheetName)!.toString("utf8");
+    const cells = parseSheetCells(sheetXml);
+    if (cells.length === 0) {
+      out.push({ name: sheetName, table: { format: "xlsx", headers: [], rows: [], headerless: true } });
+      continue;
     }
-    grid[c.row - 1][c.col - 1] = text;
+    const maxRow = Math.max(...cells.map((c) => c.row));
+    const maxCol = Math.max(...cells.map((c) => c.col));
+    if (maxRow < 1 || maxCol < 1) {
+      out.push({ name: sheetName, table: { format: "xlsx", headers: [], rows: [], headerless: true } });
+      continue;
+    }
+    const grid: string[][] = Array.from({ length: maxRow }, () => Array(maxCol).fill(""));
+    for (const c of cells) {
+      let text = "";
+      if (c.type === "s") {
+        const idx = parseInt(c.value, 10);
+        text = Number.isFinite(idx) && idx >= 0 && idx < shared.length ? shared[idx] : "";
+      } else if (c.type === "inlineStr" || c.type === "str") {
+        text = c.value;
+      } else {
+        continue; // numeric/bool/date/formula result — leave untouched
+      }
+      grid[c.row - 1][c.col - 1] = text;
+    }
+    // Trim trailing empty rows/cols (sparse sheets).
+    while (grid.length > 0 && grid[grid.length - 1].every((c) => c === "")) grid.pop();
+    let width = Math.max(0, ...grid.map((r) => r.length));
+    while (width > 0 && grid.every((r) => (r[width - 1] ?? "") === "")) width--;
+    const trimmed = grid.map((r) => r.slice(0, width));
+    if (trimmed.length === 0 || width === 0) {
+      out.push({ name: sheetName, table: { format: "xlsx", headers: [], rows: [], headerless: true } });
+      continue;
+    }
+    const looksHeaderless = trimmed.length > 1 && looksDataRow(trimmed[0]);
+    if (looksHeaderless) {
+      out.push({
+        name: sheetName,
+        table: {
+          format: "xlsx",
+          headers: Array.from({ length: width }, (_, i) => `Column ${i + 1}`),
+          rows: trimmed,
+          headerless: true,
+        },
+      });
+      continue;
+    }
+    const [header, ...body] = trimmed;
+    out.push({ name: sheetName, table: { format: "xlsx", headers: header, rows: body, headerless: false } });
   }
-  // Trim trailing empty rows/cols (sparse sheets).
-  while (grid.length > 0 && grid[grid.length - 1].every((c) => c === "")) grid.pop();
-  let width = Math.max(0, ...grid.map((r) => r.length));
-  while (width > 0 && grid.every((r) => (r[width - 1] ?? "") === "")) width--;
-  const trimmed = grid.map((r) => r.slice(0, width));
-  if (trimmed.length === 0 || width === 0)
-    return { format: "xlsx", headers: [], rows: [], headerless: true };
-  const looksHeaderless = trimmed.length > 1 && looksDataRow(trimmed[0]);
-  if (looksHeaderless) {
-    return {
-      format: "xlsx",
-      headers: Array.from({ length: width }, (_, i) => `Column ${i + 1}`),
-      rows: trimmed,
-      headerless: true,
-    };
-  }
-  const [header, ...body] = trimmed;
-  return { format: "xlsx", headers: header, rows: body, headerless: false };
+  return out;
 }
 
 /**
- * Rewrite the first worksheet with masked strings. New masked values are
- * appended to sharedStrings (original entries untouched); inline strings are
- * rewritten in place. Returns the new XLSX bytes, or null if not an XLSX.
+ * Read the first worksheet of an XLSX buffer into a TableData.
+ * Only string cells (shared/inline) participate; numbers/dates pass through.
+ */
+export function parseXlsx(buf: Buffer): TableData | null {
+  const sheets = parseXlsxSheets(buf);
+  if (!sheets || sheets.length === 0) return null;
+  return sheets[0].table;
+}
+
+/**
+ * Rewrite ALL worksheets with masked strings. Each sheet is masked with its
+ * own header row (so sheet 2 never inherits sheet 1's column policy), and
+ * new masked values are appended to sharedStrings (original entries
+ * untouched); inline strings are rewritten in place.
+ * Returns the new XLSX bytes, or null if not an XLSX.
  */
 export function buildMaskedXlsx(
   original: Buffer,
-  maskCell: (header: string, value: string, rowIdx: number, colIdx: number) => string | null
+  maskCell: (header: string, value: string, rowIdx: number, colIdx: number, sheetName: string) => string | null
 ): Buffer | null {
   let files: Map<string, Buffer>;
   try {
@@ -680,8 +733,6 @@ export function buildMaskedXlsx(
   }
   const sheetNames = [...files.keys()].filter((n) => /^xl\/worksheets\/sheet\d+\.xml$/.test(n)).sort();
   if (sheetNames.length === 0) return null;
-  const sheetName = sheetNames[0];
-  const sheetXml = files.get(sheetName)!.toString("utf8");
   let shared: string[] = [];
   const sharedXml = files.get("xl/sharedStrings.xml");
   if (sharedXml) {
@@ -691,72 +742,76 @@ export function buildMaskedXlsx(
       shared = [];
     }
   }
-  const cells = parseSheetCells(sheetXml);
-  if (cells.length === 0) return null;
-  const maxRow = Math.max(...cells.map((c) => c.row));
-  const maxCol = Math.max(...cells.map((c) => c.col));
-  const grid: (string | null)[][] = Array.from({ length: maxRow }, () => Array(maxCol).fill(null));
-  const cellType: string[][] = Array.from({ length: maxRow }, () => Array(maxCol).fill(""));
-  for (const c of cells) {
-    let text: string | null = null;
-    if (c.type === "s") {
-      const idx = parseInt(c.value, 10);
-      text = Number.isFinite(idx) && idx >= 0 && idx < shared.length ? shared[idx] : "";
-    } else if (c.type === "inlineStr" || c.type === "str") {
-      text = c.value;
-    } else {
-      continue;
-    }
-    grid[c.row - 1][c.col - 1] = text ?? "";
-    cellType[c.row - 1][c.col - 1] = c.type;
-  }
-  const width = maxCol;
-  const headerRow = grid[0] ?? [];
-  const headerless = grid.length > 1 && looksDataRow((headerRow as string[]).map((c) => c ?? ""));
-  const headers = headerless
-    ? Array.from({ length: width }, (_, i) => `Column ${i + 1}`)
-    : (headerRow as string[]).map((c) => c ?? "");
-  const startRow = headerless ? 0 : 1;
-
-  // Replacement map: "row,col" -> shared-string index (for s cells) or literal (inline).
   const sharedIndex = new Map<string, number>(shared.map((s, i) => [s, i]));
-  const replacements = new Map<string, { sharedIdx?: number; literal?: string }>();
-  for (let r = startRow; r < grid.length; r++) {
-    for (let c = 0; c < width; c++) {
-      const val = grid[r]?.[c];
-      if (val === null || val === undefined || val === "") continue;
-      const masked = maskCell(headers[c] ?? `Column ${c + 1}`, val, r, c);
-      if (masked === null || masked === val) continue;
-      let idx = sharedIndex.get(masked);
-      if (idx === undefined) {
-        idx = shared.length;
-        shared.push(masked);
-        sharedIndex.set(masked, idx);
+  let changed = false;
+  for (const sheetName of sheetNames) {
+    const sheetXml = files.get(sheetName)!.toString("utf8");
+    const cells = parseSheetCells(sheetXml);
+    if (cells.length === 0) continue;
+    const maxRow = Math.max(...cells.map((c) => c.row));
+    const maxCol = Math.max(...cells.map((c) => c.col));
+    const grid: (string | null)[][] = Array.from({ length: maxRow }, () => Array(maxCol).fill(null));
+    for (const c of cells) {
+      let text: string | null = null;
+      if (c.type === "s") {
+        const idx = parseInt(c.value, 10);
+        text = Number.isFinite(idx) && idx >= 0 && idx < shared.length ? shared[idx] : "";
+      } else if (c.type === "inlineStr" || c.type === "str") {
+        text = c.value;
+      } else {
+        continue;
       }
-      replacements.set(`${r},${c}`, { sharedIdx: idx });
+      grid[c.row - 1][c.col - 1] = text ?? "";
     }
-  }
-  if (replacements.size === 0) return null; // nothing to change — keep original bytes
+    const width = maxCol;
+    const headerRow = grid[0] ?? [];
+    const headerless = grid.length > 1 && looksDataRow((headerRow as string[]).map((c) => c ?? ""));
+    const headers = headerless
+      ? Array.from({ length: width }, (_, i) => `Column ${i + 1}`)
+      : (headerRow as string[]).map((c) => c ?? "");
+    const startRow = headerless ? 0 : 1;
 
-  const newSheetXml = sheetXml.replace(
-    /<c\b([^>]*)>([\s\S]*?)<\/c>|<c\b([^>]*)\/>/g,
-    (whole, attrs: string, inner: string, selfAttrs: string) => {
-      const a = attrs ?? selfAttrs ?? "";
-      const refM = /r="([A-Za-z]+\d+)"/.exec(a);
-      if (!refM) return whole;
-      const rc = refToRowCol(refM[1]);
-      if (!rc) return whole;
-      const rep = replacements.get(`${rc.row - 1},${rc.col - 1}`);
-      if (rep?.sharedIdx === undefined) return whole;
-      const tM = /t="([^"]*)"/.exec(a);
-      const type = tM ? tM[1] : "";
-      const newAttrs = type
-        ? a.replace(/t="[^"]*"/, 't="s"')
-        : `${a} t="s"`;
-      return `<c ${newAttrs.trim()}><v>${rep.sharedIdx}</v></c>`;
+    // Replacement map: "row,col" -> shared-string index.
+    const replacements = new Map<string, number>();
+    for (let r = startRow; r < grid.length; r++) {
+      for (let c = 0; c < width; c++) {
+        const val = grid[r]?.[c];
+        if (val === null || val === undefined || val === "") continue;
+        const masked = maskCell(headers[c] ?? `Column ${c + 1}`, val, r, c, sheetName);
+        if (masked === null || masked === val) continue;
+        let idx = sharedIndex.get(masked);
+        if (idx === undefined) {
+          idx = shared.length;
+          shared.push(masked);
+          sharedIndex.set(masked, idx);
+        }
+        replacements.set(`${r},${c}`, idx);
+      }
     }
-  );
-  files.set(sheetName, Buffer.from(newSheetXml, "utf8"));
+    if (replacements.size === 0) continue; // nothing to change on this sheet
+    changed = true;
+
+    const newSheetXml = sheetXml.replace(
+      /<c\b([^>]*)>([\s\S]*?)<\/c>|<c\b([^>]*)\/>/g,
+      (whole, attrs: string, _inner: string, selfAttrs: string) => {
+        const a = attrs ?? selfAttrs ?? "";
+        const refM = /r="([A-Za-z]+\d+)"/.exec(a);
+        if (!refM) return whole;
+        const rc = refToRowCol(refM[1]);
+        if (!rc) return whole;
+        const rep = replacements.get(`${rc.row - 1},${rc.col - 1}`);
+        if (rep === undefined) return whole;
+        const tM = /t="([^"]*)"/.exec(a);
+        const type = tM ? tM[1] : "";
+        const newAttrs = type
+          ? a.replace(/t="[^"]*"/, 't="s"')
+          : `${a} t="s"`;
+        return `<c ${newAttrs.trim()}><v>${rep}</v></c>`;
+      }
+    );
+    files.set(sheetName, Buffer.from(newSheetXml, "utf8"));
+  }
+  if (!changed) return null; // nothing to change — keep original bytes
   files.set("xl/sharedStrings.xml", Buffer.from(serializeSharedStrings(shared), "utf8"));
   // Content-Types must list sharedStrings (normally already does; add if missing).
   const ctName = "[Content_Types].xml";

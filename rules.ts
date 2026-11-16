@@ -137,10 +137,12 @@ export const RULES: Rule[] = [
   {
     kind: "IPV6",
     category: "personal",
-    // Full and ::-compressed IPv6 (requires at least 2 colons to avoid matching times/MACs).
-    re: /(?<![A-Za-z0-9:_.])(?:[A-Fa-f0-9]{0,4}:){2,7}[A-Fa-f0-9]{0,4}(?![A-Za-z0-9:_.])/g,
+    // Strict IPv6: full 8-group form or a form containing a :: compressor.
+    // Single-colon chains with fewer than 8 groups are NOT valid IPv6, so
+    // MACs (aa:bb:cc:dd:ee:ff), clock times (12:34:56) and ratios (1:2:3)
+    // can never match — every branch below requires 8 groups or a literal ::.
+    re: /(?<![A-Za-z0-9:_.])(?:(?:[A-Fa-f0-9]{1,4}:){7}[A-Fa-f0-9]{1,4}|(?:[A-Fa-f0-9]{1,4}:){1,7}:|:(?::[A-Fa-f0-9]{1,4}){1,7}|(?:[A-Fa-f0-9]{1,4}:){1,6}:[A-Fa-f0-9]{1,4}|(?:[A-Fa-f0-9]{1,4}:){1,5}(?::[A-Fa-f0-9]{1,4}){1,2}|(?:[A-Fa-f0-9]{1,4}:){1,4}(?::[A-Fa-f0-9]{1,4}){1,3}|(?:[A-Fa-f0-9]{1,4}:){1,3}(?::[A-Fa-f0-9]{1,4}){1,4}|(?:[A-Fa-f0-9]{1,4}:){1,2}(?::[A-Fa-f0-9]{1,4}){1,5}|[A-Fa-f0-9]{1,4}:(?::[A-Fa-f0-9]{1,4}){1,6})(?![A-Za-z0-9:_.])/g,
     validate: (m) => {
-      if ((m.match(/:/g) || []).length < 2) return false;
       // Skip loopback, link-local, docs range already stand-in, bare :: (often a placeholder).
       if (m === "::1" || m === "::") return false;
       const lower = m.toLowerCase();

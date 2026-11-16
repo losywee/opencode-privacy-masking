@@ -23,8 +23,9 @@ import {
   formatForExtension,
   looksLikeLegacyXls,
   looksLikeXlsx,
+  markdownTableCoversText,
   parseTableText,
-  parseXlsx,
+  parseXlsxSheets,
   resolveColumnPolicy,
   serializeTable,
   type TableData,
@@ -42,6 +43,8 @@ export class RedactStore {
   private readonly detector: LocalModelDetector;
   private readonly placeholderToReal = new Map<string, string>();
   private readonly realToPlaceholder = new Map<string, string>();
+  // Learned exact terms. Bounded like the other maps: FIFO eviction at
+  // maxMemoryValues so long sessions cannot grow memory without limit.
   private readonly knownValues = new Map<string, string>();
   private readonly envSecrets = new Set<string>();
 
@@ -326,7 +329,7 @@ export class RedactStore {
       if (s.start < cursor) continue;
       chosen.push(s);
       cursor = s.end;
-      if (s.learn) this.knownValues.set(s.value, s.kind);
+      if (s.learn) this.learnValue(s.value, s.kind);
       this.hasMaskedAny = true;
     }
 
@@ -338,6 +341,20 @@ export class RedactStore {
     }
     result += text.slice(pos);
     return result;
+  }
+
+  /** Learned exact term with FIFO eviction at maxMemoryValues. */
+  private learnValue(value: string, kind: string): void {
+    if (this.knownValues.has(value)) {
+      this.knownValues.delete(value);
+      this.knownValues.set(value, kind);
+      return;
+    }
+    if (this.knownValues.size >= this.config.maxMemoryValues) {
+      const oldest = this.knownValues.keys().next().value;
+      if (oldest !== undefined) this.knownValues.delete(oldest);
+    }
+    this.knownValues.set(value, kind);
   }
 
   private recordSticky(rawHash: string, maskedText: string): void {
@@ -455,7 +472,7 @@ export class RedactStore {
     if (this.isAllowed(value)) return value;
     const kind = this.kindForWholeCell(header, value);
     const placeholder = this.makePlaceholder(kind, value);
-    this.knownValues.set(value, kind);
+    this.learnValue(value, kind);
     this.hasMaskedAny = true;
     return placeholder;
   }
@@ -558,6 +575,10 @@ export class RedactStore {
       return null;
     }
     if (table.rows.length === 0) return null;
+    // Markdown serialization rebuilds only the table: if the table does not
+    // span the whole input, fall back to scalar masking so surrounding prose
+    // is preserved instead of silently dropped.
+    if (fmt === "md" && !markdownTableCoversText(text, table)) return null;
     const maskedRows = await this.maskTableAsync(table, turnDeadline);
     return serializeTable(table, maskedRows);
   }
@@ -572,9 +593,8 @@ export class RedactStore {
     filePath: string,
     turnDeadline = Date.now() + this.config.localModel.timeoutMs
   ): Promise<{ text?: string; bytes?: Buffer; format: TableFormat } | null> {
-    if (!this.config.tabular.enabled) return null;
-    // Legacy .xls is refused even when disabled-by-extension mapping misses:
-    // route .xls here before the format gate so it always throws loudly.
+    // Legacy .xls is refused even when tabular routing is disabled: a loud
+    // error beats silently passing an unmaskable binary blob to the LLM.
     if (filePath.toLowerCase().endsWith(".xls") && !filePath.toLowerCase().endsWith(".xlsx")) {
       let probe: Buffer | null = null;
       try {
@@ -588,6 +608,7 @@ export class RedactStore {
         );
       }
     }
+    if (!this.config.tabular.enabled) return null;
     const format = formatForExtension(filePath);
     if (!format) return null;
     let raw: Buffer;
@@ -605,11 +626,9 @@ export class RedactStore {
         );
       }
       if (!looksLikeXlsx(raw)) return null;
-      const table = parseXlsx(raw);
-      if (!table || table.rows.length === 0) return null;
-      const maskedRows = await this.maskTableAsync(table, turnDeadline);
-      const headerless = table.headerless;
-      const masked = await this.rewriteXlsxWithRows(raw, table, maskedRows, headerless);
+      const sheets = parseXlsxSheets(raw);
+      if (!sheets || sheets.every((s) => s.table.rows.length === 0)) return null;
+      const masked = await this.rewriteXlsxWithRows(raw, turnDeadline);
       if (!masked) return null;
       return { bytes: masked, format };
     }
@@ -620,32 +639,42 @@ export class RedactStore {
   }
 
   /**
-   * Rewrite XLSX string cells from masked row data (header-aware).
-   * Falls back to buildMaskedXlsx's maskCell callback path when grid math
-   * is unnecessary; here we already have masked rows, so map them directly.
+   * Rewrite XLSX via maskCell callbacks (header-aware, ALL sheets).
+   * Masks every sheet row-by-row with that sheet's own headers instead of
+   * reusing sheet 1's rows, so sheet 2+ never inherits sheet 1's policy.
    */
   private async rewriteXlsxWithRows(
     original: Buffer,
-    table: TableData,
-    maskedRows: string[][],
-    _headerless: boolean
+    turnDeadline: number
   ): Promise<Buffer | null> {
-    void _headerless;
-    // Index masked values by original value where they differ, then reuse the
-    // shared-string rewrite (handles sparse sheets + inline strings).
-    const byOriginal = new Map<string, string>();
-    const dataRows = table.headerless ? table.rows : table.rows;
-    for (let r = 0; r < dataRows.length && r < maskedRows.length; r++) {
-      const origRow = dataRows[r];
-      const maskedRow = maskedRows[r];
-      for (let c = 0; c < origRow.length && c < maskedRow.length; c++) {
-        if (origRow[c] !== "" && maskedRow[c] !== origRow[c] && !byOriginal.has(origRow[c])) {
-          byOriginal.set(origRow[c], maskedRow[c]);
+    const sheets = parseXlsxSheets(original);
+    if (!sheets) return null;
+    // Pre-mask all sheets (async, honors per-turn deadline) before the sync rewrite.
+    const maskedBySheet = new Map<string, Map<string, string>>();
+    for (const { name, table } of sheets) {
+      const maskedRows = await this.maskTableAsync(table, turnDeadline);
+      const byOriginal = new Map<string, string>();
+      const dataRows = table.headerless ? table.rows : table.rows;
+      for (let r = 0; r < dataRows.length && r < maskedRows.length; r++) {
+        const origRow = dataRows[r];
+        const maskedRow = maskedRows[r];
+        for (let c = 0; c < origRow.length && c < maskedRow.length; c++) {
+          if (origRow[c] !== "" && maskedRow[c] !== origRow[c] && !byOriginal.has(origRow[c])) {
+            byOriginal.set(origRow[c], maskedRow[c]);
+          }
         }
       }
+      maskedBySheet.set(name, byOriginal);
     }
-    if (byOriginal.size === 0) return null;
-    return buildMaskedXlsx(original, (_header, value) => byOriginal.get(value) ?? null);
+    // Rewrite: match each cell against ITS OWN sheet's mapping, routed by
+    // the sheetName buildMaskedXlsx passes to the callback. A value masked
+    // on one sheet but unmasked on another (different column policy) must
+    // NOT leak across sheets.
+    const result = buildMaskedXlsx(original, (_header, value, _r, _c, sheetName) => {
+      const map = maskedBySheet.get(sheetName);
+      return map?.get(value) ?? null;
+    });
+    return result;
   }
 
   public async maskDeepAsync(

@@ -379,6 +379,140 @@ test("Tabular: XLSX round-trip preserves workbook, masks strings", async () => {
   }
 });
 
+test("IPv6: MAC addresses, clock times and ratios are not masked", async () => {
+  const config = loadConfig(".", { localModel: { enabled: false } as any });
+  const store = new RedactStore(config);
+
+  const keep = [
+    "adapter aa:bb:cc:dd:ee:ff is down",
+    "started at 12:34:56 yesterday",
+    "meet at 10:30 tomorrow",
+    "ratio 1:2:3 holds",
+  ];
+  for (const text of keep) {
+    assert.strictEqual(await store.maskAsync(text), text, `must not mask: ${text}`);
+  }
+
+  // Real IPv6 (full + compressed) still masks and restores
+  for (const ip of ["2001:4860:4860::8888", "fe80::1:2:3:4:5", "2001:0db8:85a3:0000:0000:8a2e:0370:7334"]) {
+    if (ip.startsWith("fe80:")) {
+      assert.strictEqual(await store.maskAsync(`ping ${ip}`), `ping ${ip}`);
+      continue;
+    }
+    const masked = await store.maskAsync(`ping ${ip} now`);
+    assert.ok(masked.includes("2001:db8:"), `must mask ${ip}: ${masked}`);
+    assert.strictEqual(store.restore(masked), `ping ${ip} now`);
+  }
+  // Over-long group chains are not valid IPv6
+  assert.strictEqual(
+    await store.maskAsync("see 1:2:3:4:5:6::7:8:9:10:11:12 here"),
+    "see 1:2:3:4:5:6::7:8:9:10:11:12 here"
+  );
+});
+
+test("Tabular: markdown table+prose falls back to scalar (no data loss)", async () => {
+  const config = loadConfig(".", { localModel: { enabled: false } as any });
+  const store = new RedactStore(config);
+
+  const mixed = "| name | email |\n|---|---|\n| Al | alice@example.org |\nSome trailing note here";
+  const masked = await store.maskAsync(mixed);
+  assert.ok(masked.includes("Some trailing note here"), `trailing prose must survive: ${masked}`);
+  assert.ok(masked.includes("{{EMAIL_"), "email in table+prose must still mask via scalar path");
+  assert.strictEqual(store.restore(masked), mixed);
+
+  // Pure table still routes through the table pipeline (padded re-serialization)
+  const pure = "| name | email |\n|---|---|\n| Al | alice@example.org |";
+  const maskedPure = await store.maskAsync(pure);
+  assert.ok(maskedPure.includes("{{EMAIL_"), `pure table must mask: ${maskedPure}`);
+  assert.ok(maskedPure.includes("|"), "markdown shape preserved");
+  // Restore recovers the email; padding normalization means exact text differs
+  assert.ok(store.restore(maskedPure).includes("alice@example.org"));
+});
+
+test("Tabular: headerless markdown table keeps every data row", async () => {
+  const config = loadConfig(".", { localModel: { enabled: false } as any });
+  const store = new RedactStore(config);
+
+  const md = "| 123 | 456 |\n|---|---|\n| Al | alice@example.org |";
+  const masked = await store.maskAsync(md);
+  // Both data rows must survive (old code dropped the first via rows.slice(1))
+  assert.ok(masked.includes("123"), `first data row must survive: ${masked}`);
+  assert.ok(masked.includes("{{EMAIL_"), "email cell must mask");
+  assert.ok(masked.includes("456"), `second column of first row must survive: ${masked}`);
+  // Restore recovers all original values (padding is normalized by design)
+  const restored = store.restore(masked);
+  assert.ok(restored.includes("123") && restored.includes("456"), `numbers survive: ${restored}`);
+  assert.ok(restored.includes("alice@example.org"), `email restores: ${restored}`);
+  assert.ok(restored.includes("Al"), `name cell survives: ${restored}`);
+});
+
+test("Tabular: multi-sheet XLSX masks every sheet with its own headers", async () => {
+  const { buildZip, serializeSharedStrings, parseXlsxSheets } = await import("./tabular.ts");
+  const config = loadConfig(".", { localModel: { enabled: false } as any });
+  const store = new RedactStore(config);
+
+  // Sheet1 headers: name,email. Sheet2 headers: name,notes. Sheet 2 must be
+  // masked with its OWN headers (old code reused sheet 1's rows, leaking or
+  // mis-masking sheet 2+).
+  const shared = ["name", "email", "notes", "Alice", "alice@example.org"];
+  const cell = (ref: string, s: number) => `<c r="${ref}" t="s"><v>${s}</v></c>`;
+  const mkSheet = (headers: [number, number], row: [number, number]) =>
+    `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>` +
+    `<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><sheetData>` +
+    `<row r="1">${cell("A1", headers[0])}${cell("B1", headers[1])}</row>` +
+    `<row r="2">${cell("A2", row[0])}${cell("B2", row[1])}</row>` +
+    `</sheetData></worksheet>`;
+  const xlsx = buildZip(
+    new Map([
+      ["[Content_Types].xml", Buffer.from(`<?xml version="1.0"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Override PartName="/xl/worksheets/sheet1.xml" ContentType="w"/><Override PartName="/xl/worksheets/sheet2.xml" ContentType="w"/><Override PartName="/xl/sharedStrings.xml" ContentType="s"/></Types>`)],
+      ["xl/worksheets/sheet1.xml", Buffer.from(mkSheet([0, 1], [3, 4]))],
+      ["xl/worksheets/sheet2.xml", Buffer.from(mkSheet([0, 2], [3, 4]))],
+      ["xl/sharedStrings.xml", Buffer.from(serializeSharedStrings(shared))],
+    ])
+  );
+  const dir = mkdtempSync(join(tmpdir(), "masking-xlsx-multi-"));
+  try {
+    const file = join(dir, "two.xlsx");
+    writeFileSync(file, xlsx);
+    const res = await store.maskFileAsync(file);
+    assert.ok(res && res.format === "xlsx" && res.bytes && res.bytes.length > 0);
+    const sheets = parseXlsxSheets(res.bytes!);
+    assert.ok(sheets && sheets.length === 2, "both sheets must parse");
+    assert.deepStrictEqual(sheets[0].table.headers, ["name", "email"]);
+    assert.deepStrictEqual(sheets[1].table.headers, ["name", "notes"]);
+    // Sheet1 email cell masked with sheet1's headers
+    assert.match(sheets[0].table.rows[0][1], /^\{\{EMAIL_[a-z2-7]{8}\}\}$/, `sheet1 masked: ${sheets[0].table.rows[0]}`);
+    // Sheet2: no raw email survives anywhere
+    for (const row of sheets[1].table.rows) {
+      assert.ok(!row.some((c) => c === "alice@example.org"), `sheet2 leak: ${row}`);
+    }
+    // Round-trip: every masked value restores
+    for (const sh of sheets) {
+      for (const row of sh.table.rows) {
+        for (const c of row) {
+          const restored = store.restore(c);
+          assert.ok(restored === c || shared.includes(restored) || c === "", `restorable: ${c}`);
+        }
+      }
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("knownValues is bounded by maxMemoryValues", async () => {
+  const config = loadConfig(".", {
+    maxMemoryValues: 10,
+    localModel: { enabled: false } as any,
+  });
+  const store = new RedactStore(config);
+  for (let i = 0; i < 25; i++) {
+    await store.maskAsync(`api_key=Abcdefgh12345678_${String(i).padStart(3, "0")}`);
+  }
+  const known = (store as any).knownValues as Map<string, string>;
+  assert.ok(known.size <= 10, `knownValues size ${known.size} must be <= 10`);
+});
+
 test("Tabular: limits and legacy .xls refusal", async () => {
   const { writeFileSync: writeSync } = await import("node:fs");
   const config = loadConfig(".", {

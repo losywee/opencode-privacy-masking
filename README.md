@@ -25,7 +25,12 @@ A high-performance, bidirectional privacy and secret masking plugin for [OpenCod
   - Bounded resource safeguards: byte size limits, row/column caps, and rejection of legacy binary `.xls` files.
 - **Strict False-Positive Protections**:
   - Preserves RFC 3339 timestamps, semver tags, JSON numbers, and RFC 1918 private IP ranges (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `127.0.0.0/8`, `169.254.0.0/16`).
+  - Strict IPv6 matching (full 8-group or `::`-compressed forms only) so MAC addresses (`aa:bb:cc:dd:ee:ff`), clock times (`12:34:56`) and ratios (`1:2:3`) are never masked.
   - Validates `Basic` authentication by testing base64 decodability to printable `user:password` pairs, avoiding false positives on sentences like *"Basic authentication is required"*.
+- **Lossless Table Routing**:
+  - Markdown tables mixed with surrounding prose fall back to scalar masking so no content is ever dropped; pure tables still use the column-aware pipeline.
+  - Multi-sheet XLSX workbooks mask every sheet with its own headers (no cross-sheet policy leakage).
+  - All learned term maps (`knownValues`, sticky cache, placeholder maps) are bounded by `maxMemoryValues` (FIFO eviction); legacy binary `.xls` is refused loudly even when tabular routing is disabled.
 
 ---
 
@@ -133,7 +138,7 @@ npm test
 | `QUERY_SECRET`| URL query parameters (`?key=...&token=...`) | `?key={{QUERY_SECRET_xxxxxxxx}}` | URL boundary safe |
 | `HOSTNAME` | SSH targets and `HostName` directives | `[a-z]{8}.example` | RFC 2606 `.example` domain |
 | `IP` | Public IPv4 addresses | `203.0.113.x` | RFC 5737 TEST-NET-3; ignores RFC 1918 private |
-| `IPV6` | Public IPv6 addresses | `2001:db8:xxxx:xxxx:xxxx:xxxx` | RFC 3849 doc range; ignores `::1`, `fe80::` |
+| `IPV6` | Public IPv6 addresses (full or `::` forms) | `2001:db8:xxxx:xxxx:xxxx:xxxx` | RFC 3849 doc range; ignores `::1`, `fe80::`, MACs, clock times |
 | `EMAIL` | Email addresses | `{{EMAIL_xxxxxxxx}}` | Excludes systemd units and SSH commands |
 | `PHONE` | International (E.164), CN (+86), JP (+81), US/NANP | `{{PHONE_xxxxxxxx}}` | Excludes JSON numbers (timestamps/ports) |
 

@@ -29,6 +29,42 @@ A high-performance, bidirectional privacy and secret masking plugin for [OpenCod
 
 ---
 
+## Installation & Quickstart
+
+### One-Key Install Script
+
+The included `install.sh` script automates dependency installation, symlink/copy setup, and verification with the OpenCode CLI:
+
+```bash
+# 1. Global Installation (active across all OpenCode workspaces)
+./install.sh --global
+
+# 2. Local Workspace Installation (installs into .opencode/plugins/ in current dir)
+./install.sh --local
+
+# 3. Target Specific Project
+./install.sh --local /path/to/my-project
+
+# 4. Standalone Copy (without symlinks to source repo)
+./install.sh --global --copy
+```
+
+### Bun / NPM Setup
+
+You can also install and run tests using standard package managers:
+
+```bash
+# Using Bun
+bun install
+bun test
+
+# Using NPM
+npm install
+npm test
+```
+
+---
+
 ## Architecture & Hook Lifecycle
 
 ```
@@ -70,6 +106,8 @@ A high-performance, bidirectional privacy and secret masking plugin for [OpenCod
 ├── local-model.ts                 # Local SLM PII detector, single-flight queue & LRU cache
 ├── tabular.ts                     # Zero-dependency CSV/TSV/Markdown/XLSX masking engine
 ├── privacy-masking.ts             # Canonical plugin hook entrypoint
+├── install.sh                     # One-key installer script (global/local, link/copy)
+├── package.json                   # NPM / Bun package manifest & scripts
 ├── privacy-masking.json           # Project-level masking configuration
 ├── opencode.json                  # OpenCode environment & runtime settings
 ├── register-hooks.mjs             # Node.js ESM TypeScript loader hook registration

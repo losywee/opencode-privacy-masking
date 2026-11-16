@@ -1,0 +1,30 @@
+{
+  "name": "opencode-privacy-masking",
+  "version": "1.0.0",
+  "description": "Bidirectional privacy masking and secret redaction plugin for OpenCode",
+  "type": "module",
+  "main": "privacy-masking.ts",
+  "scripts": {
+    "test": "node --import ./register-hooks.mjs --test test_privacy_masking.ts",
+    "install:global": "./install.sh --global",
+    "install:local": "./install.sh --local",
+    "install:plugin": "./install.sh"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "privacy",
+    "privacy-masking",
+    "redaction",
+    "secrets",
+    "security",
+    "pii"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@opencode-ai/plugin": "^1.19.5"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0"
+  }
+}
